@@ -6,9 +6,9 @@ import sys
 from typing import Optional
 
 from bs4 import BeautifulSoup
+from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
-import httpx
 import uvicorn
 
 DEFAULT_HEADERS = {
@@ -52,7 +52,7 @@ class FilmowScraper:
     async def fetch_page(
         self,
         url: str,
-        client: httpx.AsyncClient,
+        client: AsyncSession,
         max_retries: int = 4,
         backoff_delay: float = 3.0,
     ) -> Optional[str]:
@@ -61,21 +61,19 @@ class FilmowScraper:
             for attempt in range(1, max_retries + 1):
                 try:
                     response = await client.get(url, headers=DEFAULT_HEADERS)
-                    if response.status_code == 404:
+                    if response.status_code == 200:
+                        await asyncio.sleep(0.8)
+                        return response.text
+                    elif response.status_code == 404:
                         return None
-                    response.raise_for_status()
-
-                    await asyncio.sleep(1.0)
-                    return response.text
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 429:
+                    elif response.status_code == 429:
                         wait_time = backoff_delay * attempt
                         print(f"Rate limited (429) fetching {url}. Waiting {wait_time:.1f}s (attempt {attempt}/{max_retries})...")
                         await asyncio.sleep(wait_time)
                     else:
-                        print(f"HTTP error {exc.response.status_code} fetching {url}")
+                        print(f"HTTP error {response.status_code} fetching {url}")
                         return None
-                except httpx.RequestError as exc:
+                except Exception as exc:
                     wait_time = backoff_delay * attempt
                     print(f"Network error fetching {url} ({exc}). Retrying in {wait_time:.1f}s...")
                     await asyncio.sleep(wait_time)
@@ -150,7 +148,7 @@ class FilmowScraper:
 
     async def fetch_movie_details(
         self,
-        client: httpx.AsyncClient,
+        client: AsyncSession,
         movie: dict,
         max_retries: int = 4,
         backoff_delay: float = 2.0,
@@ -167,8 +165,9 @@ class FilmowScraper:
                         wait_time = backoff_delay * attempt
                         await asyncio.sleep(wait_time)
                         continue
+                    elif response.status_code != 200:
+                        break
 
-                    response.raise_for_status()
                     data = response.json()
 
                     movie_meta = data.get("movie", {})
@@ -190,13 +189,7 @@ class FilmowScraper:
 
                     return movie
 
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 429:
-                        wait_time = backoff_delay * attempt
-                        await asyncio.sleep(wait_time)
-                    else:
-                        break
-                except httpx.RequestError as exc:
+                except Exception:
                     wait_time = backoff_delay * attempt
                     await asyncio.sleep(wait_time)
 
@@ -207,13 +200,13 @@ class FilmowScraper:
         username: str,
         category: str = "filmes",
         list_type: str = "ja-vi",
-        client: Optional[httpx.AsyncClient] = None,
+        client: Optional[AsyncSession] = None,
     ) -> tuple[list[dict], int]:
         """Scrape all movies for a given user, category, and list type. Returns (movies, total_pages)."""
         base_url = f"https://filmow.com/usuario/{username}/{category}/{list_type}/"
         own_client = False
         if client is None:
-            client = httpx.AsyncClient(follow_redirects=True, timeout=15.0)
+            client = AsyncSession(impersonate="chrome120", timeout=20.0)
             own_client = True
 
         try:
@@ -233,7 +226,7 @@ class FilmowScraper:
                     if html:
                         all_movies.extend(self.parse_movies_from_page(html))
 
-            print(f"[{category}] Found {total_pages} page(s) with {len(all_movies)} movies. Fetching titles & years...")
+            print(f"[{category}] Encontrada(s) {total_pages} página(s) com {len(all_movies)} filmes. Buscando detalhes...")
 
             detail_tasks = [
                 self.fetch_movie_details(client, movie)
@@ -244,7 +237,7 @@ class FilmowScraper:
 
         finally:
             if own_client:
-                await client.aclose()
+                await client.close()
 
 
 def generate_letterboxd_csv(movies: list[dict]) -> io.StringIO:
@@ -399,16 +392,22 @@ async def home():
 async def export_letterboxd_csv(
     username: str = Query(..., description="Nome de usuário no Filmow"),
 ):
+    clean_username = username.strip().lower().lstrip("@")
+    if "filmow.com/usuario/" in clean_username:
+        match = re.search(r"filmow\.com/usuario/([^/]+)", clean_username)
+        if match:
+            clean_username = match.group(1)
+
     scraper = FilmowScraper()
     categories_to_scrape = ["filmes", "curtas", "tv"]
 
     all_movies = []
     total_pages_count = 0
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+    async with AsyncSession(impersonate="chrome120", timeout=20.0) as client:
         for cat in categories_to_scrape:
             movies, pages = await scraper.scrape_list(
-                username=username,
+                username=clean_username,
                 category=cat,
                 list_type="ja-vi",
                 client=client,
@@ -419,14 +418,14 @@ async def export_letterboxd_csv(
     if not all_movies:
         raise HTTPException(
             status_code=404,
-            detail=f"Nenhum filme assistido foi encontrado para o usuário '{username}'. Verifique se o perfil existe e se é público.",
+            detail=f"Nenhum filme assistido foi encontrado para o usuário '{clean_username}'. Verifique se o perfil existe e se é público.",
         )
 
-    print(f"\n[RESUMO] Encontradas {total_pages_count} página(s) e {len(all_movies)} filmes para '{username}'.")
+    print(f"\n[RESUMO] Encontradas {total_pages_count} página(s) e {len(all_movies)} filmes para '{clean_username}'.")
 
     csv_buffer = generate_letterboxd_csv(all_movies)
 
-    filename = f"letterboxd_{username}_watched.csv"
+    filename = f"letterboxd_{clean_username}_watched.csv"
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Content-Type": "text/csv; charset=utf-8",
@@ -443,15 +442,21 @@ async def export_letterboxd_csv(
 
 
 async def cli_export(username: str):
+    clean_username = username.strip().lower().lstrip("@")
+    if "filmow.com/usuario/" in clean_username:
+        match = re.search(r"filmow\.com/usuario/([^/]+)", clean_username)
+        if match:
+            clean_username = match.group(1)
+
     scraper = FilmowScraper()
     categories = ["filmes", "curtas", "tv"]
     all_movies = []
     total_pages_count = 0
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+    async with AsyncSession(impersonate="chrome120", timeout=20.0) as client:
         for cat in categories:
             movies, pages = await scraper.scrape_list(
-                username=username,
+                username=clean_username,
                 category=cat,
                 list_type="ja-vi",
                 client=client,
@@ -460,11 +465,11 @@ async def cli_export(username: str):
             total_pages_count += pages
 
     if not all_movies:
-        print(f"Nenhum filme assistido foi encontrado ou não foi possível acessar o perfil de '{username}'.")
+        print(f"Nenhum filme assistido foi encontrado ou não foi possível acessar o perfil de '{clean_username}'.")
         return
 
     csv_data = generate_letterboxd_csv(all_movies)
-    output_filename = f"letterboxd_{username}_watched.csv"
+    output_filename = f"letterboxd_{clean_username}_watched.csv"
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(csv_data.getvalue())
 
